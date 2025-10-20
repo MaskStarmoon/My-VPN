@@ -1,12 +1,12 @@
+// server.js
 const http = require("http");
 const https = require("https");
 const net = require("net");
 const url = require("url");
 
-const PORT = process.env.PORT || 8080;
-const PROXY_TOKEN = process.env.PROXY_TOKEN || "my-secret-token";
+const PORT = process.env.PORT || 20045;
 
-// Range IP per negara
+// Range IP per negara (pakai daftar yang kamu berikan)
 const REGION_RANGES = {
   japan: [
     ["43.0.0.0", "43.223.255.255"],
@@ -67,96 +67,113 @@ const REGION_RANGES = {
   ]
 };
 
-// convert IP string to number
+// helper konversi IP <-> number
 function ipToNumber(ip) {
-  return ip.split(".").reduce((acc, oct) => acc * 256 + parseInt(oct), 0);
+  return ip.split(".").reduce((acc, oct) => acc * 256 + parseInt(oct, 10), 0) >>> 0;
 }
-
-// convert number to IP string
 function numberToIp(num) {
-  return [
-    (num >> 24) & 255,
-    (num >> 16) & 255,
-    (num >> 8) & 255,
-    num & 255
-  ].join(".");
+  return [(num >>> 24) & 255, (num >>> 16) & 255, (num >>> 8) & 255, num & 255].join(".");
 }
 
-// generate IP acak dari range
 function randomIpFromRegion(region) {
   const ranges = REGION_RANGES[region];
-  if (!ranges || ranges.length === 0) return null;
+  if (!ranges || !ranges.length) return null;
   const r = ranges[Math.floor(Math.random() * ranges.length)];
   const start = ipToNumber(r[0]);
   const end = ipToNumber(r[1]);
-  const random = Math.floor(Math.random() * (end - start + 1)) + start;
-  return numberToIp(random);
+  const n = Math.floor(Math.random() * (end - start + 1)) + start;
+  return numberToIp(n);
 }
 
-function log(...msg) { console.log(new Date().toISOString(), ...msg); }
+function log(...s) { console.log(new Date().toISOString(), ...s); }
 
 const server = http.createServer((req, res) => {
-  // token optional
-  const clientToken = req.headers["x-proxy-token"];
-  if (PROXY_TOKEN && clientToken !== PROXY_TOKEN) {
-    res.writeHead(403, {"Content-Type":"text/plain"});
-    res.end("Forbidden: invalid proxy token");
-    return;
+  // parse url dan query
+  const parsed = url.parse(req.url, true);
+
+  // jika tidak ada host di url (biasanya browser proxy), kita harus ambil target dari req.headers.host
+  // namun di forward proxy request, req.url biasanya berisi full URL (http://host/...), jadi parsed.hostname ok.
+  // Tujuan: tentukan targetHost & targetPort
+  let targetHost = parsed.hostname || parsed.host || req.headers['host'];
+  let targetPort = parsed.port || (parsed.protocol === 'https:' ? 443 : 80);
+
+  // jika frontend mengirim ?region=..., kita pilih IP palsu dan sisipkan header
+  const region = parsed.query && parsed.query.region;
+  let fakeIp = null;
+  if (region) {
+    fakeIp = randomIpFromRegion(region);
   }
 
-  // ambil region dari query ?region=japan
-  const parsedUrl = url.parse(req.url, true);
-  let targetHost = parsedUrl.query.region ? randomIpFromRegion(parsedUrl.query.region) : parsedUrl.hostname;
-  const targetPort = parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80);
-  const targetProtocol = parsedUrl.protocol === "https:" ? https : http;
+  // Jika parsed.pathname = '/' dan tidak ada targetHost nyata (mis. pemanggilan ke root proxy),
+  // kita bisa jadikan server merespon sendiri (diagnostic)
+  if (!targetHost || targetHost === `127.0.0.1:${PORT}` || targetHost.includes(`:${PORT}`) ) {
+    // untuk akses langsung ke proxy root, tampilkan info
+    res.writeHead(200, {'Content-Type':'text/plain'});
+    return res.end(`Proxy running. Use as forward proxy or call with ?region=japan\nFake IP example: ${fakeIp||'none'}`);
+  }
+
+  // siapkan opsi forward; jika parsed.href berisi full URL, gunakan parsed.protocol
+  const protocol = parsed.protocol === 'https:' ? https : http;
+
+  // clone headers, tapi jangan teruskan some hop-by-hop headers
+  const headers = Object.assign({}, req.headers);
+  delete headers['proxy-connection'];
+  delete headers['connection'];
+  delete headers['keep-alive'];
+  delete headers['transfer-encoding'];
+  delete headers['upgrade'];
+
+  // sisipkan header IP palsu kalau ada region
+  if (fakeIp) {
+    // jika ada X-Forwarded-For yang lama, append, kalau tidak buat baru
+    const prev = headers['x-forwarded-for'] || headers['X-Forwarded-For'];
+    headers['x-forwarded-for'] = prev ? `${prev}, ${fakeIp}` : fakeIp;
+    headers['x-client-ip'] = fakeIp;
+    headers['x-geo-region'] = region;
+    headers['via'] = (headers['via'] ? headers['via'] + ', ' : '') + `fake-proxy/${PORT}`;
+  }
 
   const options = {
-    hostname: targetHost,
-    port: targetPort,
-    path: parsedUrl.path,
+    hostname: targetHost.split(':')[0],
+    port: targetPort || (protocol === https ? 443 : 80),
+    path: parsed.path || parsed.pathname || '/',
     method: req.method,
-    headers: req.headers
+    headers: headers
   };
-  delete options.headers["x-proxy-token"];
 
-  const proxyReq = targetProtocol.request(options, proxyRes => {
+  // buat request ke target
+  const proxyReq = protocol.request(options, (proxyRes) => {
+    // salin headers balik ke client
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res, { end: true });
   });
 
-  proxyReq.on("error", err => {
-    res.writeHead(502, {"Content-Type":"text/plain"});
-    res.end("Proxy Error: " + err.message);
+  proxyReq.on('error', (err) => {
+    log('Proxy request error', err.message);
+    res.writeHead(502, {'Content-Type':'text/plain'});
+    res.end('Proxy Error: ' + err.message);
   });
 
   req.pipe(proxyReq, { end: true });
 });
 
-// HTTPS CONNECT
-server.on("connect", (req, clientSocket, head) => {
-  const clientToken = req.headers["x-proxy-token"];
-  if (PROXY_TOKEN && clientToken !== PROXY_TOKEN) {
-    clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    clientSocket.destroy();
-    return;
-  }
-
-  const [host, port] = req.url.split(":");
+server.on('connect', (req, clientSocket, head) => {
+  // CONNECT: buat tunnel TCP, kita *tidak bisa* menyisip header palsu ke target karena seluruh TLS terenkripsi
+  const [host, port] = req.url.split(':');
   const serverSocket = net.connect(port || 443, host, () => {
-    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-    serverSocket.write(head);
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length) serverSocket.write(head);
     serverSocket.pipe(clientSocket);
     clientSocket.pipe(serverSocket);
   });
 
-  serverSocket.on("error", err => {
-    log("HTTPS Proxy error:", err.message);
-    clientSocket.destroy();
+  serverSocket.on('error', (err) => {
+    log('CONNECT error', err.message);
+    clientSocket.end();
   });
 });
 
 server.listen(PORT, () => {
-  log(`✅ Proxy server berjalan di port ${PORT}`);
-  log("Gunakan header x-proxy-token jika diperlukan");
-  log("Preset negara: japan / china / korea");
+  log(`Proxy server berjalan di port ${PORT}`);
+  log('Preset region tersedia:', Object.keys(REGION_RANGES).join(', '));
 });
